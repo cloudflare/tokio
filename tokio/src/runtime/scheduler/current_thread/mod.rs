@@ -12,10 +12,11 @@ use crate::util::{waker_ref, RngSeedGenerator, Wake, WakerRef};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::Ordering::{AcqRel, Release};
 use std::task::Poll::{Pending, Ready};
 use std::task::Waker;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{fmt, thread};
 
 /// Executes tasks on the current thread
@@ -753,6 +754,92 @@ impl CoreGuard<'_> {
         *context.core.borrow_mut() = Some(core);
 
         ret
+    }
+
+    /// Turn over the
+    #[track_caller]
+    fn turn<F: Future>(
+        self,
+        mut future: Pin<&mut F>,
+    ) -> (std::task::Poll<<F as Future>::Output>, Option<SystemTime>) {
+        let ret = self.enter(|mut core, context| {
+            let waker = Handle::waker_ref(&context.handle);
+            let mut cx = std::task::Context::from_waker(&waker);
+
+            core.metrics.start_processing_scheduled_tasks();
+
+            'outer: loop {
+                let handle = &context.handle;
+
+                if handle.reset_woken() {
+                    let (c, res) = context.enter(core, || {
+                        crate::runtime::coop::budget(|| future.as_mut().poll(&mut cx))
+                    });
+
+                    core = c;
+
+                    if let Ready(v) = res {
+                        return (core, Some(v));
+                    }
+                }
+
+                for _ in 0..handle.shared.config.event_interval {
+                    // Make sure we didn't hit an unhandled_panic
+                    if core.unhandled_panic {
+                        return (core, None);
+                    }
+
+                    core.tick();
+
+                    let entry = core.next_task(handle);
+
+                    if let Some(task) = entry {
+                        let task = context.handle.shared.owned.assert_owner(task);
+
+                        let (c, ()) = context.run_task(core, || {
+                            task.run();
+                        });
+
+                        core = c;
+                    }
+                }
+
+                core.metrics.end_processing_scheduled_tasks();
+
+                // Yield to the driver, this drives the timer and pulls any
+                // pending I/O events.
+                core = context.park_yield(core, handle);
+
+                core.metrics.start_processing_scheduled_tasks();
+            }
+        });
+
+        match ret {
+            Some(ret) => (std::task::Poll::Ready(ret), None),
+            None => {
+                // `block_on` panicked.
+                panic!("a spawned task panicked and the runtime is configured to shut down on unhandled panic");
+            }
+        }
+    }
+
+    /// Turn over the IO driver
+    #[track_caller]
+    fn turn_driver(self) -> Option<SystemTime> {
+        let ret = self.enter(|mut core, context| {
+            let waker = Handle::waker_ref(&context.handle);
+            let mut cx = std::task::Context::from_waker(&waker);
+
+            let handle = &context.handle;
+
+            handle.reset_woken();
+
+            // Yield to the driver, this drives the timer and pulls any
+            // pending I/O events.
+            core = context.park_yield(core, handle);
+        });
+
+        None
     }
 }
 
